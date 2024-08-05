@@ -6,4 +6,4 @@ This Python bot listens to private Telegram channels or groups for trading signa
 - Wallet setup using Phantom/private key
 - Basic config for buy amount and slippage
 - Ready for expansion with stop-loss and auto-sell logic
-<!-- updated: 2024-04-16-r01 -->
+<!-- updated: 2024-08-05-r01 -->
