@@ -1,0 +1,6 @@
+telethon
+solders
+solana
+jupiter-python-sdk
+httpx
+python-dotenv
