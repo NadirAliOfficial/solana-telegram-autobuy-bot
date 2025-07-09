@@ -16,15 +16,19 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # === Load config from .env ===
-load_dotenv()
-API_ID             = int(os.getenv("API_ID"))
-API_HASH           = os.getenv("API_HASH")
-PHONE              = os.getenv("PHONE")
-GROUP              = int(os.getenv("GROUP"))         # Quartz [SOL] channel ID
-BOT_TOKEN          = os.getenv("BOT_TOKEN")          # Telegram bot token
-RPC_URL            = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
-BUY_AMOUNT_SOL     = float(os.getenv("BUY_AMOUNT_SOL"))
-SLIPPAGE_PCT       = float(os.getenv("SLIPPAGE"))    # e.g. 10 for 10%
+load_dotenv()  # Loads WALLET_PRIVATE_KEY from .env
+
+# Hardcoded values
+API_ID = 26820360
+API_HASH = "79c18a74d33d25d2d18ca9cf8000e4f6"
+PHONE = "+41796129161"
+GROUP = -1001993316422
+BOT_TOKEN = "7655208071:AAFYp08k9F8a7Tb3Z0GXp5mhQa48hAyr53s"
+BUY_AMOUNT_SOL = 0.05
+SLIPPAGE_PCT = 10.0
+RPC_URL = "https://api.mainnet-beta.solana.com"
+
+# Private key from .env
 WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY")
 
 # Constants

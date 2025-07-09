@@ -1,6 +1,6 @@
+python-dotenv
 telethon
 solders
 solana
 jupiter-python-sdk
-httpx
-python-dotenv
+python-telegram-bot
