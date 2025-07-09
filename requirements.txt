@@ -4,3 +4,4 @@ solders
 solana
 jupiter-python-sdk
 python-telegram-bot
+nest_asyncio
