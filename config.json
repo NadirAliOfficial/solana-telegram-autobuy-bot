@@ -1,0 +1,8 @@
+{
+    "BUY_AMOUNT_SOL": 0.05,
+    "SLIPPAGE_PCT": 10.0,
+    "STOP_LOSS_PCT": 30.0,
+    "AUTO_SELL_ENABLED": true,
+    "SELL_AFTER_SECONDS": 180
+  }
+  
