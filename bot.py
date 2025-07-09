@@ -4,7 +4,8 @@ import json
 import asyncio
 import base64
 import threading
-
+import nest_asyncio
+nest_asyncio.apply()  # allow nested event loops in Jupyter
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from solders.keypair import Keypair
