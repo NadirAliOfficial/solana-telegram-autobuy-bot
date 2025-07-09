@@ -231,7 +231,9 @@ def run_bot():
     app.add_handler(conv)
 
     print("[✓] Bot commands running…")
-    app.run_polling()
+    # disable signal handlers when running in a non-main thread
+    app.run_polling(stop_signals=())
+
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
