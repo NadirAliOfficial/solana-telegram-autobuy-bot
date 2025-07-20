@@ -21,8 +21,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import nest_asyncio
-nest_asyncio.apply()
+
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
@@ -106,21 +105,26 @@ async def auto_buy(
     lamports_in = int(amount_sol * 1e9)
     slippage    = int(s["SLIPPAGE_PCT"] * 100)
 
-    # fetch quote instead of get_routes()
+    # fetch a quote (dict) instead of get_routes()
     quote = await jup.quote(
         input_mint=WSOL_MINT,
         output_mint=mint,
         amount=lamports_in,
         slippage_bps=slippage
     )
-    routes = quote.routes
+    # now safely extract routes from dict or object
+    if isinstance(quote, dict):
+        routes = quote.get("routes") or quote.get("data", {}).get("routes", [])
+    else:
+        routes = getattr(quote, "routes", [])
+
     if not routes:
-        await bot.send_message(chat_id, f"❌ No route for {mint}")
+        await bot.send_message(chat_id, f"❌ No route to buy `{mint}`")
         return
     lamports_out = routes[0].out_amount
     buy_price    = lamports_in / lamports_out
 
-    # execute buy
+    # execute the buy swap
     swap_b64 = await jup.swap(
         input_mint=WSOL_MINT,
         output_mint=mint,
@@ -166,10 +170,10 @@ async def monitor_and_sell(
     chat_id,
     bot
 ):
-    s        = get_settings()
-    tiers    = sorted(s["SELL_TIERS"], key=lambda t: t["profit_pct"])
-    remaining= lamports_out
-    highest  = buy_price
+    s         = get_settings()
+    tiers     = sorted(s["SELL_TIERS"], key=lambda t: t["profit_pct"])
+    remaining = lamports_out
+    highest   = buy_price
 
     while remaining > 0 and tiers:
         # fetch reverse quote
@@ -179,9 +183,13 @@ async def monitor_and_sell(
             amount=remaining,
             slippage_bps=int(s["SLIPPAGE_PCT"] * 100)
         )
-        routes = quote.routes
+        if isinstance(quote, dict):
+            routes = quote.get("routes") or quote.get("data", {}).get("routes", [])
+        else:
+            routes = getattr(quote, "routes", [])
+
         if not routes:
-            await bot.send_message(chat_id, f"❌ Price fetch failed for {mint}")
+            await bot.send_message(chat_id, f"❌ Price fetch failed for `{mint}`")
             await asyncio.sleep(s["POLL_INTERVAL"])
             continue
 
@@ -215,7 +223,7 @@ async def monitor_and_sell(
                     remaining -= sell_amt
                 tiers.remove(tier)
 
-        # trailing stop
+        # trailing stop:
         drop_thr = highest * (1 - s["TRAILING_STOP_DROP_PCT"]/100)
         if current_price <= drop_thr:
             swap_b64 = await jup.swap(
@@ -306,7 +314,15 @@ async def buy_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mint    = ctx.user_data['mint']
     chat_id = update.effective_chat.id
     await update.message.reply_text(f"🔄 Buying {amt} SOL of {mint}...")
-    await auto_buy(mint, wallet, sol_client, jup_client, purchase_amount=amt, chat_id=chat_id, bot=ctx.bot)
+    await auto_buy(
+        mint,
+        wallet,
+        sol_client,
+        jup_client,
+        purchase_amount=amt,
+        chat_id=chat_id,
+        bot=ctx.bot
+    )
     return ConversationHandler.END
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -331,7 +347,11 @@ def run_bot():
         fallbacks=[CommandHandler('cancel', cancel)]
     )
 
-    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app = ApplicationBuilder()\
+        .token(BOT_TOKEN)\
+        .concurrent_updates(True)\
+        .build()
+
     app.add_handler(CommandHandler('start', start_cmd))
     app.add_handler(CommandHandler('get',   get_cmd))
     app.add_handler(conv_set)
