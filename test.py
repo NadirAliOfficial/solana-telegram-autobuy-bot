@@ -23,6 +23,9 @@ from telegram.ext import (
     filters,
 )
 
+import nest_asyncio
+nest_asyncio.apply()  # allow nested event loops in Jupyter
+
 # ─── LOGGING SETUP ────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
