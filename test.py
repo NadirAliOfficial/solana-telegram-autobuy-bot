@@ -21,6 +21,9 @@ from telegram.ext import (
     filters,
 )
 
+import nest_asyncio
+nest_asyncio.apply()  # Allow nested event loops for async operations
+
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
