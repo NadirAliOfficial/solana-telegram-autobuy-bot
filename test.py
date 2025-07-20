@@ -22,8 +22,6 @@ from telegram.ext import (
     filters,
 )
 
-import nest_asyncio
-nest_asyncio.apply()  # Allow nested event loops for async/await compatibility
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
@@ -103,11 +101,11 @@ async def auto_buy(
     bot=None
 ):
     s = get_settings()
-    amount_sol  = purchase_amount if purchase_amount is not None else s["BUY_AMOUNT_SOL"]
-    lamports_in = int(amount_sol * 1e9)
-    slippage_bps= int(s["SLIPPAGE_PCT"] * 100)
+    amount_sol   = purchase_amount if purchase_amount is not None else s["BUY_AMOUNT_SOL"]
+    lamports_in  = int(amount_sol * 1e9)
+    slippage_bps = int(s["SLIPPAGE_PCT"] * 100)
 
-    # estimate output + price
+    # (buggy) estimate output + price via get_routes()
     routes = await jup.get_routes(
         input_mint=WSOL_MINT,
         output_mint=mint,
@@ -167,10 +165,10 @@ async def monitor_and_sell(
     chat_id,
     bot
 ):
-    s        = get_settings()
-    tiers    = sorted(s["SELL_TIERS"], key=lambda t: t["profit_pct"])
-    remaining= lamports_out
-    highest  = buy_price
+    s         = get_settings()
+    tiers     = sorted(s["SELL_TIERS"], key=lambda t: t["profit_pct"])
+    remaining = lamports_out
+    highest   = buy_price
 
     while remaining > 0 and tiers:
         routes = await jup.get_routes(
@@ -187,7 +185,7 @@ async def monitor_and_sell(
         current_price = routes[0].out_amount / remaining
         highest       = max(highest, current_price)
 
-        # check each profit tier
+        # check profit tiers
         for tier in list(tiers):
             if current_price >= buy_price * (1 + tier["profit_pct"]/100):
                 sell_amt = int(remaining * (tier["sell_pct"]/100))
@@ -302,8 +300,8 @@ async def buy_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("Invalid amount. Try again:")
         return BT_AMT
-    mint   = ctx.user_data['mint']
-    chat_id= update.effective_chat.id
+    mint    = ctx.user_data['mint']
+    chat_id = update.effective_chat.id
     await update.message.reply_text(f"🔄 Buying {amt} SOL of {mint}...")
     await auto_buy(mint, wallet, sol_client, jup_client, purchase_amount=amt, chat_id=chat_id, bot=ctx.bot)
     return ConversationHandler.END
@@ -330,7 +328,11 @@ def run_bot():
         fallbacks=[CommandHandler('cancel', cancel)]
     )
 
-    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app = ApplicationBuilder() \
+        .token(BOT_TOKEN) \
+        .concurrent_updates(True) \
+        .build()
+
     app.add_handler(CommandHandler('start', start_cmd))
     app.add_handler(CommandHandler('get',   get_cmd))
     app.add_handler(conv_set)
