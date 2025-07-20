@@ -21,7 +21,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
+import nest_asyncio
+nest_asyncio.apply()
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
