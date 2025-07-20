@@ -19,11 +19,7 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
-)           
-
-
-import nest_asyncio
-nest_asyncio.apply()  # allow nested event loops in Jupyter
+)
 
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 CONFIG_FILE = "config.json"
@@ -65,7 +61,7 @@ def get_settings():
 # ─── ENV & CLIENT SETUP ─────────────────────────────────────────────────────
 load_dotenv()
 WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY")
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # e.g. set in your .env file
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
 WSOL_MINT = os.getenv("WSOL_MINT", "So11111111111111111111111111111111111111112")
 
@@ -89,11 +85,10 @@ async def create_clients(wallet_keypair):
     return sol, jup
 
 # ─── SWAP LOGIC ──────────────────────────────────────────────────────────────
-async def auto_buy(mint: str, wallet_keypair, sol, jup, buy_amount_override=None):
+async def auto_buy(mint: str, wallet_keypair, sol, jup, buy_amount_override=None, chat_id=None, bot=None):
     s = get_settings()
     if buy_amount_override is not None:
         s["BUY_AMOUNT_SOL"] = buy_amount_override
-    print(f"\n[→] Attempting swap for {mint} …")
     try:
         swap_b64 = await jup.swap(
             input_mint=WSOL_MINT,
@@ -102,35 +97,57 @@ async def auto_buy(mint: str, wallet_keypair, sol, jup, buy_amount_override=None
             slippage_bps=int(s["SLIPPAGE_PCT"] * 100),
         )
     except Exception as e:
-        if "not tradable" in str(e):
-            print(f"[!] {mint} not tradable — skipping.")
-            return False
-        print(f"[x] Jupiter error for {mint}: {e}")
-        return False
+        if chat_id and bot:
+            await bot.send_message(chat_id=chat_id, text=f"❌ Jupiter error for {mint}: {e}")
+        return None
 
     raw = VersionedTransaction.from_bytes(base64.b64decode(swap_b64))
     sig = wallet_keypair.sign_message(message.to_bytes_versioned(raw.message))
     txn = VersionedTransaction.populate(raw.message, [sig])
 
-    print(f"[→] Sending transaction for {mint} …")
     resp = await sol.send_raw_transaction(
         txn=bytes(txn),
         opts=TxOpts(skip_preflight=True, preflight_commitment=Processed),
     )
     txid = getattr(resp, "result", getattr(resp, "value", str(resp)))
-    print(f"[✓] Swap succeeded for {mint}: {txid}")
 
-    if s["AUTO_SELL_ENABLED"]:
+    if chat_id and bot:
+        await bot.send_message(chat_id=chat_id, text=f"✅ Swap succeeded for {mint}: `{txid}`", parse_mode="Markdown")
+
+    # schedule auto-sell
+    if s["AUTO_SELL_ENABLED"] and chat_id and bot:
         asyncio.create_task(
-            schedule_sell(mint, wallet_keypair, sol, jup, s["SELL_AFTER_SECONDS"])
+            schedule_sell(mint, wallet_keypair, sol, jup, s["SELL_AFTER_SECONDS"], chat_id, bot)
         )
-    return True
+    return txid
 
-async def schedule_sell(mint, wallet_keypair, sol, jup, delay: int):
+async def schedule_sell(mint, wallet_keypair, sol, jup, delay: int, chat_id=None, bot=None):
     await asyncio.sleep(delay)
-    print(f"[→] (AUTO-SELL) swapping {mint} back to WSOL…")
-    # TODO: implement your reverse-swap logic here
-    print(f"[!] AUTO-SELL for {mint} is placeholder — add your logic.")
+    s = get_settings()
+    try:
+        swap_b64 = await jup.swap(
+            input_mint=mint,
+            output_mint=WSOL_MINT,
+            amount=int(s["BUY_AMOUNT_SOL"] * 1e9),
+            slippage_bps=int(s["SLIPPAGE_PCT"] * 100),
+        )
+    except Exception as e:
+        if chat_id and bot:
+            await bot.send_message(chat_id=chat_id, text=f"❌ AUTO-SELL error for {mint}: {e}")
+        return
+
+    raw = VersionedTransaction.from_bytes(base64.b64decode(swap_b64))
+    sig = wallet_keypair.sign_message(message.to_bytes_versioned(raw.message))
+    txn = VersionedTransaction.populate(raw.message, [sig])
+
+    resp = await sol.send_raw_transaction(
+        txn=bytes(txn),
+        opts=TxOpts(skip_preflight=True, preflight_commitment=Processed),
+    )
+    txid = getattr(resp, "result", getattr(resp, "value", str(resp)))
+
+    if chat_id and bot:
+        await bot.send_message(chat_id=chat_id, text=f"🔄 AUTO-SELL succeeded for {mint}: `{txid}`", parse_mode="Markdown")
 
 # ─── TELEGRAM BOT COMMANDS ──────────────────────────────────────────────────
 CHOOSING_KEY, TYPING_VALUE = range(2)
@@ -192,7 +209,7 @@ async def buy_mint(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mint = update.message.text.strip()
     ctx.user_data['buy_mint'] = mint
     await update.message.reply_text(
-        f"Mint set to {mint}\nNow enter the amount in SOL to spend (e.g. 0.05):"
+        f"Mint set to `{mint}`\nNow enter the amount in SOL to spend (e.g. 0.05):", parse_mode="Markdown"
     )
     return BUY_AMOUNT
 
@@ -207,12 +224,19 @@ async def buy_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return BUY_AMOUNT
 
     mint = ctx.user_data['buy_mint']
-    await update.message.reply_text(f"🔄 Buying {mint} for {amount} SOL...")
-    success = await auto_buy(mint, wallet, sol_client, jup_client, buy_amount_override=amount)
-    if success:
-        await update.message.reply_text(f"✅ Buy order for {mint} submitted.")
-    else:
-        await update.message.reply_text(f"❌ Failed to buy {mint}. Check logs.")
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"🔄 Buying `{mint}` for {amount} SOL...", parse_mode="Markdown")
+    txid = await auto_buy(
+        mint,
+        wallet,
+        sol_client,
+        jup_client,
+        buy_amount_override=amount,
+        chat_id=chat_id,
+        bot=ctx.bot,
+    )
+    if not txid:
+        await update.message.reply_text(f"❌ Failed to buy `{mint}`. Check logs.", parse_mode="Markdown")
     return ConversationHandler.END
 
 # ─── RUN BOT ────────────────────────────────────────────────────────────────
@@ -251,7 +275,6 @@ def run_bot():
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ensure_config()
-    # initialize wallet & clients before starting bot
     wallet = setup_wallet(WALLET_PRIVATE_KEY)
     if not wallet:
         exit(1)
