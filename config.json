@@ -1,8 +1,13 @@
+
 {
-    "BUY_AMOUNT_SOL": 0.05,
-    "SLIPPAGE_PCT": 10.0,
-    "STOP_LOSS_PCT": 30.0,
-    "AUTO_SELL_ENABLED": true,
-    "SELL_AFTER_SECONDS": 180
-  }
-  
+  "BUY_AMOUNT_SOL":     0.05,
+  "SLIPPAGE_PCT":       10.0,
+  "AUTO_SELL_ENABLED":  true,
+  "SELL_TIERS": [
+    { "profit_pct":  50, "sell_pct": 50 },
+    { "profit_pct": 100, "sell_pct": 20 },
+    { "profit_pct": 200, "sell_pct": 20 },
+    { "profit_pct": 500, "sell_pct": 10 }
+  ],
+  "TRAILING_STOP_DROP_PCT": 10.0
+}
