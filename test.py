@@ -22,20 +22,17 @@ from telegram.ext import (
     filters,
 )
 
+import nest_asyncio
+nest_asyncio.apply()  # allow nested loops in Jupyter/non-main threads
+
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
-CONFIG_FILE = "config.json"
-DEFAULT_CONFIG = {
-    "BUY_AMOUNT_SOL":         0.05,
-    "SLIPPAGE_PCT":           10.0,
-    "AUTO_SELL_ENABLED":      True,
-    "SELL_TIERS": [
-        {"profit_pct":  50, "sell_pct": 50},
-        {"profit_pct": 100, "sell_pct": 20},
-        {"profit_pct": 200, "sell_pct": 20},
-        {"profit_pct": 500, "sell_pct": 10}
-    ],
-    "TRAILING_STOP_DROP_PCT": 10.0,
-    "POLL_INTERVAL":          15
+CONFIG_FILE     = "config.json"
+DEFAULT_CONFIG  = {
+    "BUY_AMOUNT_SOL":     0.05,
+    "SLIPPAGE_PCT":       10.0,
+    "STOP_LOSS_PCT":      30.0,
+    "AUTO_SELL_ENABLED":  True,
+    "SELL_AFTER_SECONDS": 180,
 }
 
 def ensure_config():
@@ -54,12 +51,11 @@ def save_config(cfg):
 def get_settings():
     cfg = load_config()
     return {
-        "BUY_AMOUNT_SOL":         float(cfg.get("BUY_AMOUNT_SOL",  DEFAULT_CONFIG["BUY_AMOUNT_SOL"])),
-        "SLIPPAGE_PCT":           float(cfg.get("SLIPPAGE_PCT",    DEFAULT_CONFIG["SLIPPAGE_PCT"])),
-        "AUTO_SELL_ENABLED":      bool(cfg.get("AUTO_SELL_ENABLED",DEFAULT_CONFIG["AUTO_SELL_ENABLED"])),
-        "SELL_TIERS":             cfg.get("SELL_TIERS",          DEFAULT_CONFIG["SELL_TIERS"]),
-        "TRAILING_STOP_DROP_PCT": float(cfg.get("TRAILING_STOP_DROP_PCT",DEFAULT_CONFIG["TRAILING_STOP_DROP_PCT"])),
-        "POLL_INTERVAL":          int(cfg.get("POLL_INTERVAL",     DEFAULT_CONFIG["POLL_INTERVAL"]))
+        "BUY_AMOUNT_SOL":     float(cfg.get("BUY_AMOUNT_SOL", DEFAULT_CONFIG["BUY_AMOUNT_SOL"])),
+        "SLIPPAGE_PCT":       float(cfg.get("SLIPPAGE_PCT", DEFAULT_CONFIG["SLIPPAGE_PCT"])),
+        "STOP_LOSS_PCT":      float(cfg.get("STOP_LOSS_PCT", DEFAULT_CONFIG["STOP_LOSS_PCT"])),
+        "AUTO_SELL_ENABLED":  bool(cfg.get("AUTO_SELL_ENABLED", DEFAULT_CONFIG["AUTO_SELL_ENABLED"])),
+        "SELL_AFTER_SECONDS": int(cfg.get("SELL_AFTER_SECONDS", DEFAULT_CONFIG["SELL_AFTER_SECONDS"])),
     }
 
 # ─── ENV & CLIENT SETUP ─────────────────────────────────────────────────────
@@ -72,9 +68,9 @@ WSOL_MINT          = os.getenv(
     "So11111111111111111111111111111111111111112"
 )
 
-wallet = None
-sol_client: AsyncClient = None
-jup_client: Jupiter = None
+wallet      = None
+sol_client  = None
+jup_client  = None
 
 def setup_wallet(pk_str: str):
     try:
@@ -90,281 +86,214 @@ async def create_clients(wallet_keypair):
     jup = Jupiter(sol, wallet_keypair)
     return sol, jup
 
-# ─── SWAP & MONITOR LOGIC ───────────────────────────────────────────────────
+# ─── SWAP LOGIC ──────────────────────────────────────────────────────────────
 async def auto_buy(
     mint: str,
     wallet_keypair,
     sol,
     jup,
-    purchase_amount=None,
-    chat_id=None,
-    bot=None
+    buy_amount_override=None
 ):
-    s           = get_settings()
-    amount_sol  = purchase_amount if purchase_amount is not None else s["BUY_AMOUNT_SOL"]
-    lamports_in = int(amount_sol * 1e9)
-    slippage    = int(s["SLIPPAGE_PCT"] * 100)
+    s = get_settings()
+    if buy_amount_override is not None:
+        s["BUY_AMOUNT_SOL"] = buy_amount_override
 
-    # fetch a quote (dict) instead of get_routes()
+    lamports_in = int(s["BUY_AMOUNT_SOL"] * 1e9)
+    slippage_bps = int(s["SLIPPAGE_PCT"] * 100)
+
+    # 1) Quote routes so we can compute price
     quote = await jup.quote(
         input_mint=WSOL_MINT,
         output_mint=mint,
         amount=lamports_in,
-        slippage_bps=slippage
+        slippage_bps=slippage_bps,
     )
-    # now safely extract routes from dict or object
+    # extract routes whether quote is dict or object
     if isinstance(quote, dict):
         routes = quote.get("routes") or quote.get("data", {}).get("routes", [])
     else:
         routes = getattr(quote, "routes", [])
 
     if not routes:
-        await bot.send_message(chat_id, f"❌ No route to buy `{mint}`")
-        return
+        return None, None
+
     lamports_out = routes[0].out_amount
     buy_price    = lamports_in / lamports_out
 
-    # execute the buy swap
+    # 2) Execute the swap
     swap_b64 = await jup.swap(
         input_mint=WSOL_MINT,
         output_mint=mint,
         amount=lamports_in,
-        slippage_bps=slippage
+        slippage_bps=slippage_bps,
     )
     raw_tx = VersionedTransaction.from_bytes(base64.b64decode(swap_b64))
     sig    = wallet_keypair.sign_message(message.to_bytes_versioned(raw_tx.message))
     txn    = VersionedTransaction.populate(raw_tx.message, [sig])
     resp   = await sol.send_raw_transaction(
         txn=bytes(txn),
-        opts=TxOpts(skip_preflight=True, preflight_commitment=Processed)
+        opts=TxOpts(skip_preflight=True, preflight_commitment=Processed),
     )
     txid   = getattr(resp, "result", getattr(resp, "value", str(resp)))
 
-    await bot.send_message(
-        chat_id,
-        f"✅ Bought {amount_sol} SOL of `{mint}` @ {buy_price:.6f} SOL/token → tx `{txid}`",
-        parse_mode="Markdown"
-    )
-
+    # 3) Schedule the time-based sell if enabled
     if s["AUTO_SELL_ENABLED"]:
         asyncio.create_task(
-            monitor_and_sell(
-                mint,
-                lamports_out,
-                buy_price,
-                wallet_keypair,
-                sol,
-                jup,
-                chat_id,
-                bot
-            )
+            schedule_sell(mint, lamports_out, wallet_keypair, sol, jup, s["SELL_AFTER_SECONDS"])
         )
 
-async def monitor_and_sell(
+    return txid, buy_price
+
+async def schedule_sell(
     mint: str,
     lamports_out: int,
-    buy_price: float,
     wallet_keypair,
     sol,
     jup,
-    chat_id,
-    bot
+    delay: int
 ):
-    s         = get_settings()
-    tiers     = sorted(s["SELL_TIERS"], key=lambda t: t["profit_pct"])
-    remaining = lamports_out
-    highest   = buy_price
+    await asyncio.sleep(delay)
+    print(f"[→] (AUTO-SELL) swapping {mint} back to WSOL…")
 
-    while remaining > 0 and tiers:
-        # fetch reverse quote
-        quote = await jup.quote(
-            input_mint=mint,
-            output_mint=WSOL_MINT,
-            amount=remaining,
-            slippage_bps=int(s["SLIPPAGE_PCT"] * 100)
-        )
-        if isinstance(quote, dict):
-            routes = quote.get("routes") or quote.get("data", {}).get("routes", [])
-        else:
-            routes = getattr(quote, "routes", [])
+    # reverse swap logic
+    s = get_settings()
+    slippage_bps = int(s["SLIPPAGE_PCT"] * 100)
+    swap_b64 = await jup.swap(
+        input_mint=mint,
+        output_mint=WSOL_MINT,
+        amount=lamports_out,
+        slippage_bps=slippage_bps,
+    )
+    raw_tx = VersionedTransaction.from_bytes(base64.b64decode(swap_b64))
+    sig    = wallet_keypair.sign_message(message.to_bytes_versioned(raw_tx.message))
+    txn    = VersionedTransaction.populate(raw_tx.message, [sig])
+    resp   = await sol.send_raw_transaction(
+        txn=bytes(txn),
+        opts=TxOpts(skip_preflight=True, preflight_commitment=Processed),
+    )
+    txid   = getattr(resp, "result", getattr(resp, "value", str(resp)))
+    print(f"[✓] AUTO-SELL succeeded for {mint}: {txid}")
 
-        if not routes:
-            await bot.send_message(chat_id, f"❌ Price fetch failed for `{mint}`")
-            await asyncio.sleep(s["POLL_INTERVAL"])
-            continue
-
-        current_price = routes[0].out_amount / remaining
-        highest       = max(highest, current_price)
-
-        # profit tiers
-        for tier in list(tiers):
-            if current_price >= buy_price * (1 + tier["profit_pct"]/100):
-                sell_amt = int(remaining * (tier["sell_pct"]/100))
-                if sell_amt:
-                    swap_b64 = await jup.swap(
-                        input_mint=mint,
-                        output_mint=WSOL_MINT,
-                        amount=sell_amt,
-                        slippage_bps=int(s["SLIPPAGE_PCT"] * 100)
-                    )
-                    raw_tx = VersionedTransaction.from_bytes(base64.b64decode(swap_b64))
-                    sig    = wallet_keypair.sign_message(message.to_bytes_versioned(raw_tx.message))
-                    txn    = VersionedTransaction.populate(raw_tx.message, [sig])
-                    resp   = await sol.send_raw_transaction(
-                        txn=bytes(txn),
-                        opts=TxOpts(skip_preflight=True, preflight_commitment=Processed)
-                    )
-                    txid = getattr(resp, "result", getattr(resp, "value", str(resp)))
-                    await bot.send_message(
-                        chat_id,
-                        f"🔸 Sold {tier['sell_pct']}% @ +{tier['profit_pct']}% → tx `{txid}`",
-                        parse_mode="Markdown"
-                    )
-                    remaining -= sell_amt
-                tiers.remove(tier)
-
-        # trailing stop:
-        drop_thr = highest * (1 - s["TRAILING_STOP_DROP_PCT"]/100)
-        if current_price <= drop_thr:
-            swap_b64 = await jup.swap(
-                input_mint=mint,
-                output_mint=WSOL_MINT,
-                amount=remaining,
-                slippage_bps=int(s["SLIPPAGE_PCT"] * 100)
-            )
-            raw_tx = VersionedTransaction.from_bytes(base64.b64decode(swap_b64))
-            sig    = wallet_keypair.sign_message(message.to_bytes_versioned(raw_tx.message))
-            txn    = VersionedTransaction.populate(raw_tx.message, [sig])
-            resp   = await sol.send_raw_transaction(
-                txn=bytes(txn),
-                opts=TxOpts(skip_preflight=True, preflight_commitment=Processed)
-            )
-            txid = getattr(resp, "result", getattr(resp, "value", str(resp)))
-            await bot.send_message(
-                chat_id,
-                f"🛑 Trailing stop sold remaining → tx `{txid}`",
-                parse_mode="Markdown"
-            )
-            break
-
-        await asyncio.sleep(s["POLL_INTERVAL"])
-
-# ─── TELEGRAM BOT HANDLERS ───────────────────────────────────────────────────
-ST_KEY, ST_VAL = range(2)
-BT_MINT, BT_AMT = range(2)
+# ─── TELEGRAM BOT COMMANDS ──────────────────────────────────────────────────
+CHOOSING_KEY, TYPING_VALUE = range(2)
+BUY_MINT, BUY_AMOUNT       = range(2)
 
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Bot ready!\n"
+        "MemeMachine Bot ready!\n"
         "/get – show settings\n"
-        "/set – change settings\n"
-        "/buy – manual buy"
+        "/set – change a setting\n"
+        "/buy – initiate manual buy"
     )
 
 async def get_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cfg  = load_config()
-    text = "\n".join(f"{k}: {v}" for k, v in cfg.items())
-    await update.message.reply_text(f"Settings:\n{text}")
+    cfg = load_config()
+    txt = "\n".join(f"{k}: {v}" for k, v in cfg.items())
+    await update.message.reply_text(f"⚙️ Current settings:\n{txt}")
 
 async def set_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     keys = ", ".join(DEFAULT_CONFIG.keys())
     await update.message.reply_text(f"Which setting? ({keys})")
-    return ST_KEY
+    return CHOOSING_KEY
 
-async def set_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def choose_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     key = update.message.text.strip()
     cfg = load_config()
     if key not in cfg:
-        await update.message.reply_text("Unknown setting.")
+        await update.message.reply_text(f"❌ Unknown key: {key}\nTry /set again.")
         return ConversationHandler.END
-    ctx.user_data['set_key'] = key
-    await update.message.reply_text(f"Enter new value for {key}:")
-    return ST_VAL
+    ctx.user_data["key"] = key
+    await update.message.reply_text(f"Enter new value for `{key}`:")
+    return TYPING_VALUE
 
-async def set_val(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    key = ctx.user_data['set_key']
+async def receive_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    key = ctx.user_data["key"]
     val = update.message.text.strip()
     cfg = load_config()
     try:
-        cfg[key] = json.loads(val)
-    except json.JSONDecodeError:
-        try:
-            cfg[key] = float(val) if '.' in val else int(val)
-        except:
-            cfg[key] = val
-    save_config(cfg)
-    await update.message.reply_text(f"✅ {key} set to {cfg[key]}")
-    return ConversationHandler.END
-
-async def buy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Enter mint address:")
-    return BT_MINT
-
-async def buy_mint(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data['mint'] = update.message.text.strip()
-    await update.message.reply_text("Enter SOL amount to spend:")
-    return BT_AMT
-
-async def buy_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        amt = float(update.message.text.strip())
-    except:
-        await update.message.reply_text("Invalid amount. Try again:")
-        return BT_AMT
-    mint    = ctx.user_data['mint']
-    chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🔄 Buying {amt} SOL of {mint}...")
-    await auto_buy(
-        mint,
-        wallet,
-        sol_client,
-        jup_client,
-        purchase_amount=amt,
-        chat_id=chat_id,
-        bot=ctx.bot
-    )
+        if val.lower() in ("true", "false"):
+            cfg[key] = val.lower() == "true"
+        else:
+            cfg[key] = float(val)
+        save_config(cfg)
+        await update.message.reply_text(f"✅ `{key}` set to `{cfg[key]}`")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
     return ConversationHandler.END
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
+# ─── BUY CONVERSATION ───────────────────────────────────────────────────────
+async def buy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Enter the mint address you want to buy:")
+    return BUY_MINT
+
+async def buy_mint(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["buy_mint"] = update.message.text.strip()
+    await update.message.reply_text("Now enter the amount in SOL to spend (e.g. 0.05):")
+    return BUY_AMOUNT
+
+async def buy_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        amount = float(text)
+    except ValueError:
+        await update.message.reply_text("Invalid number. Try again:")
+        return BUY_AMOUNT
+
+    mint = ctx.user_data["buy_mint"]
+    await update.message.reply_text(f"🔄 Buying {amount} SOL of {mint}…")
+    txid, price = await auto_buy(mint, wallet, sol_client, jup_client, buy_amount_override=amount)
+
+    if txid:
+        await update.message.reply_text(
+            f"✅ Swap succeeded: `{txid}`\n"
+            f"Price: {price:.6f} SOL per token",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("❌ Swap failed. Check logs.")
+
+    return ConversationHandler.END
+
 def run_bot():
     conv_set = ConversationHandler(
-        entry_points=[CommandHandler('set', set_start)],
+        entry_points=[CommandHandler("set", set_start)],
         states={
-            ST_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_key)],
-            ST_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_val)],
+            CHOOSING_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_key)],
+            TYPING_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_value)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
     conv_buy = ConversationHandler(
-        entry_points=[CommandHandler('buy', buy_start)],
+        entry_points=[CommandHandler("buy", buy_start)],
         states={
-            BT_MINT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_mint)],
-            BT_AMT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amt)],
+            BUY_MINT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_mint)],
+            BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    app = ApplicationBuilder()\
-        .token(BOT_TOKEN)\
-        .concurrent_updates(True)\
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
         .build()
-
-    app.add_handler(CommandHandler('start', start_cmd))
-    app.add_handler(CommandHandler('get',   get_cmd))
+    )
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("get",   get_cmd))
     app.add_handler(conv_set)
     app.add_handler(conv_buy)
 
-    print('[✓] Bot running...')
+    print("[✓] Bot commands running…")
     app.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     ensure_config()
     wallet = setup_wallet(WALLET_PRIVATE_KEY)
     if not wallet:
-        print('[x] Wallet setup failed. Check WALLET_PRIVATE_KEY.')
         exit(1)
     sol_client, jup_client = asyncio.run(create_clients(wallet))
     run_bot()
