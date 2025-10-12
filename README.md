@@ -56,4 +56,3 @@ Use a dedicated wallet with only the funds you intend to trade. Never use your m
 
 MIT
 
-
