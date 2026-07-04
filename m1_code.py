@@ -255,6 +255,6 @@ if __name__ == "__main__":
     # initialize wallet & clients before starting bot
     wallet = setup_wallet(WALLET_PRIVATE_KEY)
     if not wallet:
-        exit(1)
+        sys.exit(1)
     sol_client, jup_client = asyncio.run(create_clients(wallet))
     run_bot()
