@@ -350,6 +350,6 @@ if __name__ == "__main__":
     wallet = setup_wallet(WALLET_PRIVATE_KEY)
     if not wallet:
         logger.error("Wallet initialization failed. Exiting.")
-        sys.exit(1)
+        sys.sys.exit(1)
     sol_client, jup_client = asyncio.run(create_clients(wallet))
     run_bot()
